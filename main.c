@@ -20,6 +20,9 @@ int client_mode = 0;
 /* Just send a ping and exit */
 int ping_mode = 0;
 
+/* Use UDP sockets and lossy tox packets */
+int client_lossy_mode = 0;
+
 /* Open a local port and forward it */
 int client_local_port_mode = 0;
 
@@ -142,7 +145,7 @@ void update_select_nfds(int fd)
 }
 
 /* Constructor. Returns NULL on failure. */
-tunnel *tunnel_create(int sockfd, int connid, uint32_t friendnumber)
+tunnel *tunnel_create(int sockfd, int connid, uint32_t friendnumber, bool is_udp)
 {
     tunnel *t = NULL;
 
@@ -155,6 +158,7 @@ tunnel *tunnel_create(int sockfd, int connid, uint32_t friendnumber)
     t->sockfd = sockfd;
     t->connid = connid;
     t->friendnumber = friendnumber;
+    t->is_udp = is_udp;
 
     log_printf(L_INFO, "Created a new tunnel object connid=%d sockfd=%d\n", connid, sockfd);
 
@@ -289,7 +293,7 @@ void *get_in_addr(struct sockaddr *sa)
 }
 
 /* Connect to an endpoint, return sockfd */
-int get_client_socket(char *hostname, int port)
+int get_client_socket(char *hostname, int port, bool is_udp)
 {
     int sockfd;
     struct addrinfo hints, *servinfo, *p;
@@ -302,6 +306,9 @@ int get_client_socket(char *hostname, int port)
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
+    if (is_udp) {
+        hints.ai_socktype = SOCK_DGRAM;
+    }
 
     if ((rv = getaddrinfo(hostname, port_str, &hints, &servinfo)) != 0) 
     {
@@ -361,18 +368,18 @@ int get_client_socket(char *hostname, int port)
 /* Proto - our protocol handling */
 
 /* 
- * send_frame: (almost) zero-copy. Overwrites first PROTOCOL_BUFFER_OFFSET bytes of data 
+ * send_frame_lossless: (almost) zero-copy. Overwrites first PROTOCOL_BUFFER_OFFSET bytes of data 
  * so actual data should start at position PROTOCOL_BUFFER_OFFSET
  */
-int send_frame(protocol_frame *frame, uint8_t *data)
+int send_lossless_frame(protocol_frame *frame, uint8_t *data)
 {
     int rv = -1;
     int try = 0;
     int i;
     TOX_ERR_FRIEND_CUSTOM_PACKET custom_packet_error;
 
-    data[0] = PROTOCOL_MAGIC_HIGH;
-    data[1] = PROTOCOL_MAGIC_LOW;
+    data[0] = PROTOCOL_MAGIC_LOSSLESS_HIGH;
+    data[1] = PROTOCOL_MAGIC_LOSSLESS_LOW;
     data[2] = BYTE2(frame->packet_type);
     data[3] = BYTE1(frame->packet_type);
     data[4] = BYTE2(frame->connid);
@@ -434,6 +441,47 @@ int send_frame(protocol_frame *frame, uint8_t *data)
     return rv;
 }
 
+/* 
+ * send_frame_lossy: (almost) zero-copy. Overwrites first PROTOCOL_BUFFER_OFFSET bytes of data 
+ * so actual data should start at position PROTOCOL_BUFFER_OFFSET
+ */
+int send_lossy_frame(protocol_frame *frame, uint8_t *data)
+{
+    int rv = -1;
+    TOX_ERR_FRIEND_CUSTOM_PACKET custom_packet_error;
+
+    data[0] = PROTOCOL_MAGIC_LOSSY_HIGH;
+    data[1] = PROTOCOL_MAGIC_LOSSY_LOW;
+    data[2] = BYTE2(frame->packet_type);
+    data[3] = BYTE1(frame->packet_type);
+    data[4] = BYTE2(frame->connid);
+    data[5] = BYTE1(frame->connid);
+    data[6] = BYTE2(frame->data_length);
+    data[7] = BYTE1(frame->data_length);
+
+        rv = tox_friend_send_lossy_packet(
+                tox,
+                frame->friendnumber,
+                data,
+                frame->data_length + PROTOCOL_BUFFER_OFFSET,
+                &custom_packet_error
+        );
+
+        if(custom_packet_error != TOX_ERR_FRIEND_CUSTOM_PACKET_OK)
+        {
+            if(custom_packet_error == TOX_ERR_FRIEND_CUSTOM_PACKET_FRIEND_NOT_CONNECTED)
+            {
+                log_printf(L_DEBUG, "[lossy] Failed to send packet to friend %d (Friend gone)\n", frame->friendnumber);
+            }
+            else
+            {
+                log_printf(L_DEBUG, "[lossy] Failed to send packet to friend %d (err: %u)\n", frame->friendnumber, custom_packet_error);
+            }
+        }
+
+    return rv;
+}
+
 int send_tunnel_ack_frame(tunnel *tun, uint32_t remote_forward_id)
 {
     protocol_frame frame_st;
@@ -443,7 +491,16 @@ int send_tunnel_ack_frame(tunnel *tun, uint32_t remote_forward_id)
     frame = &frame_st;
     memset(frame, 0, sizeof(protocol_frame));
 
-    frame->packet_type = PACKET_TYPE_ACKTUNNEL;
+    
+    if (tun->is_udp)
+    {
+        frame->packet_type = PACKET_TYPE_ACKTUNNEL_UDP;
+    }
+    else
+    {
+        frame->packet_type = PACKET_TYPE_ACKTUNNEL_TCP;
+    }
+
     frame->connid = tun->connid;
     frame->data_length = 4;
     frame->friendnumber = tun->friendnumber;
@@ -454,7 +511,7 @@ int send_tunnel_ack_frame(tunnel *tun, uint32_t remote_forward_id)
     data[PROTOCOL_BUFFER_OFFSET+1] = BYTE3(remote_forward_id);
     data[PROTOCOL_BUFFER_OFFSET] = BYTE4(remote_forward_id);
 
-    return send_frame(frame, data);
+    return send_lossless_frame(frame, data);
 }
 
 int handle_ping_frame(protocol_frame *rcvd_frame)
@@ -470,12 +527,12 @@ int handle_ping_frame(protocol_frame *rcvd_frame)
     frame->packet_type = PACKET_TYPE_PONG;
     frame->data_length = rcvd_frame->data_length;
     
-    send_frame(frame, data);
+    send_lossless_frame(frame, data);
 
     return 0;
 }
 
-int handle_request_tunnel_frame(protocol_frame *rcvd_frame)
+int handle_request_tunnel_frame(protocol_frame *rcvd_frame, bool is_udp)
 {
     char *hostname = NULL;
     tunnel *tun;
@@ -537,10 +594,10 @@ int handle_request_tunnel_frame(protocol_frame *rcvd_frame)
     tunnel_id = get_random_tunnel_id();
     log_printf(L_DEBUG, "Tunnel ID: %d\n", tunnel_id);
 
-    sockfd = get_client_socket(hostname, port);
+    sockfd = get_client_socket(hostname, port, is_udp);
     if(sockfd >= 0)
     {
-        tun = tunnel_create(sockfd, tunnel_id, rcvd_frame->friendnumber);
+        tun = tunnel_create(sockfd, tunnel_id, rcvd_frame->friendnumber, is_udp);
         if(tun)
         {
             FD_SET(sockfd, &master_server_fds);
@@ -565,8 +622,10 @@ int handle_request_tunnel_frame(protocol_frame *rcvd_frame)
     return 0;
 }
 
-/* Handle a TCP frame received from client */
-int handle_client_tcp_frame(protocol_frame *rcvd_frame)
+
+
+/* Handle a frame received from client */
+int handle_client_data_frame(protocol_frame *rcvd_frame)
 {
     tunnel *tun=NULL;
     int offset = 0;
@@ -576,7 +635,7 @@ int handle_client_tcp_frame(protocol_frame *rcvd_frame)
 
     if(!tun)
     {
-        log_printf(L_WARNING, "Got TCP frame with unknown tunnel ID %d\n", rcvd_frame->connid);
+        log_printf(L_WARNING, "Got data frame with unknown tunnel ID %d\n", rcvd_frame->connid);
         return -1;
     }
 
@@ -610,7 +669,7 @@ int handle_client_tcp_frame(protocol_frame *rcvd_frame)
 }
 
 /* Handle close-tunnel frame received from the client */
-int handle_client_tcp_fin_frame(protocol_frame *rcvd_frame)
+int handle_client_fin_frame(protocol_frame *rcvd_frame)
 {
     tunnel *tun=NULL;
     int connid = rcvd_frame->connid;
@@ -619,7 +678,7 @@ int handle_client_tcp_fin_frame(protocol_frame *rcvd_frame)
 
     if(!tun)
     {
-        log_printf(L_WARNING, "Got TCP FIN frame with unknown tunnel ID %d\n", rcvd_frame->connid);
+        log_printf(L_WARNING, "Got FIN frame with unknown tunnel ID %d\n", rcvd_frame->connid);
         return -1;
     }
 
@@ -629,7 +688,7 @@ int handle_client_tcp_fin_frame(protocol_frame *rcvd_frame)
         return -1;
     }
     
-    log_printf(L_DEBUG2, "Deleting tunnel #%d (%p) in handle_client_tcp_fin_frame(), socket %d", rcvd_frame->connid, tun, tun->sockfd);
+    log_printf(L_DEBUG2, "Deleting tunnel #%d (%p) in handle_client_fin_frame(), socket %d", rcvd_frame->connid, tun, tun->sockfd);
     tunnel_queue_delete(tun);
 
     return 0;
@@ -646,30 +705,36 @@ int handle_frame(protocol_frame *frame)
         case PACKET_TYPE_PONG:
             return handle_pong_frame(frame);
             break;
-        case PACKET_TYPE_TCP:
+        case PACKET_TYPE_DATA:
             if(client_mode)
             {
-                return handle_server_tcp_frame(frame);
+                return handle_server_data_frame(frame);
             }
             else
             {
-                return handle_client_tcp_frame(frame);
+                return handle_client_data_frame(frame);
             }
             break;
-        case PACKET_TYPE_REQUESTTUNNEL:
-            handle_request_tunnel_frame(frame);
+        case PACKET_TYPE_REQUESTTUNNEL_TCP:
+            handle_request_tunnel_frame(frame, false);
             break;
-        case PACKET_TYPE_ACKTUNNEL:
-            handle_acktunnel_frame(frame);
+        case PACKET_TYPE_REQUESTTUNNEL_UDP:
+            handle_request_tunnel_frame(frame, true);
             break;
-        case PACKET_TYPE_TCP_FIN:
+        case PACKET_TYPE_ACKTUNNEL_TCP:
+            handle_acktunnel_frame(frame, false);
+            break;
+        case PACKET_TYPE_ACKTUNNEL_UDP:
+            handle_acktunnel_frame(frame, true);
+            break;
+        case PACKET_TYPE_FIN:
             if(client_mode)
             {
-                return handle_server_tcp_fin_frame(frame);
+                return handle_server_fin_frame(frame);
             }
             else
             {
-                return handle_client_tcp_fin_frame(frame);
+                return handle_client_fin_frame(frame);
             }
             break;
         default:
@@ -703,10 +768,10 @@ void parse_lossless_packet(Tox *tox, uint32_t friendnumber, const uint8_t *data,
         return;
     }
 
-    if(data[0] != PROTOCOL_MAGIC_HIGH || data[1] != PROTOCOL_MAGIC_LOW)
+    if(data[0] != PROTOCOL_MAGIC_LOSSLESS_HIGH || data[1] != PROTOCOL_MAGIC_LOSSLESS_LOW)
     {
         log_printf(L_WARNING, "Received data frame with invalid protocol magic number 0x%x%x\n", data[0], data[1]);
-        if(data[0] == (PROTOCOL_MAGIC_V1 >> 8) && data[1] == (PROTOCOL_MAGIC_V1 & 0xff)) 
+        if(data[0] == (PROTOCOL_MAGIC_V1_LOSSLESS >> 8) && data[1] == (PROTOCOL_MAGIC_V1_LOSSLESS & 0xff)) 
         {
             log_printf(L_ERROR, "Tuntox on the other end uses old protocol version 1. Please upgrade it.");
         }
@@ -747,6 +812,12 @@ void parse_lossless_packet(Tox *tox, uint32_t friendnumber, const uint8_t *data,
     free(frame);
 }
 
+void parse_lossy_packet(Tox *tox, uint32_t friendnumber, const uint8_t *data, size_t len, void *tmp)
+{
+    log_printf(L_ERROR, "TODO: add lossy packet parsing\n");
+    exit(1);
+}
+
 int send_tunnel_request_packet(char *remote_host, int remote_port, uint32_t local_forward_id, int friend_number)
 {
     int packet_length = 0;
@@ -774,12 +845,18 @@ int send_tunnel_request_packet(char *remote_host, int remote_port, uint32_t loca
 
     memcpy((char *)data+PROTOCOL_BUFFER_OFFSET+4, remote_host, strlen(remote_host));
 
+    if(client_lossy_mode) {
+        frame->packet_type = PACKET_TYPE_REQUESTTUNNEL_UDP;
+    }
+    else {
+        frame->packet_type = PACKET_TYPE_REQUESTTUNNEL_TCP;
+    }
+
     frame->friendnumber = friend_number;
-    frame->packet_type = PACKET_TYPE_REQUESTTUNNEL;
     frame->connid = remote_port;
     frame->data_length = strlen(remote_host) + 4; 
 
-    send_frame(frame, data);
+    send_lossless_frame(frame, data);
 
     free(data);
     return 0;
@@ -1005,6 +1082,97 @@ void cleanup()
 }
 
 
+void server_forward_udp(tunnel *tun, unsigned char tox_packet_buf[PROTOCOL_MAX_PACKET_SIZE]) {
+    int nbytes = recv(tun->sockfd, 
+        tox_packet_buf+PROTOCOL_BUFFER_OFFSET, 
+        READ_BUFFER_SIZE, 0);
+
+    if(nbytes == -1)
+    {
+        if(errno == EAGAIN || errno == EWOULDBLOCK)
+        {
+            log_printf(L_DEBUG2, "Nothing to send from UDP socket %d\n", tun->sockfd);
+            return;
+        }
+
+        uint8_t data[PROTOCOL_BUFFER_OFFSET];
+        protocol_frame frame_st, *frame;
+
+        log_printf(L_WARNING, "conn closed, code=%d (%s)\n",
+            errno, strerror(errno));
+
+
+        frame = &frame_st;
+        memset(frame, 0, sizeof(protocol_frame));
+        frame->friendnumber = tun->friendnumber;
+        frame->packet_type = PACKET_TYPE_FIN;
+        frame->connid = tun->connid;
+        frame->data_length = 0;
+        send_lossless_frame(frame, data);
+
+        tunnel_queue_delete(tun);
+                                            
+        return;
+    }
+
+    protocol_frame frame_st, *frame;
+
+    frame = &frame_st;
+    memset(frame, 0, sizeof(protocol_frame));
+    frame->friendnumber = tun->friendnumber;
+    frame->packet_type = PACKET_TYPE_DATA;
+    frame->connid = tun->connid;
+    frame->data_length = nbytes;
+    send_lossy_frame(frame, tox_packet_buf);
+}
+
+void server_forward_tcp(tunnel *tun, unsigned char tox_packet_buf[PROTOCOL_MAX_PACKET_SIZE]) {
+    int nbytes = recv(tun->sockfd, 
+        tox_packet_buf+PROTOCOL_BUFFER_OFFSET, 
+        READ_BUFFER_SIZE, 0);
+
+    if(nbytes <= 0)
+    {
+        uint8_t data[PROTOCOL_BUFFER_OFFSET];
+        protocol_frame frame_st, *frame;
+
+        if(nbytes == 0)
+        {
+            log_printf(L_WARNING, "conn closed!\n");
+        }
+        else
+        {
+            log_printf(L_WARNING, "conn closed, code=%d (%s)\n",
+                errno, strerror(errno));
+        }
+
+        frame = &frame_st;
+        memset(frame, 0, sizeof(protocol_frame));
+        frame->friendnumber = tun->friendnumber;
+        frame->packet_type = PACKET_TYPE_FIN;
+        frame->connid = tun->connid;
+        frame->data_length = 0;
+        send_lossless_frame(frame, data);
+
+        tunnel_queue_delete(tun);
+                                            
+        return;
+    }
+
+    protocol_frame frame_st, *frame;
+
+    frame = &frame_st;
+    memset(frame, 0, sizeof(protocol_frame));
+    frame->friendnumber = tun->friendnumber;
+    frame->packet_type = PACKET_TYPE_DATA;
+    frame->connid = tun->connid;
+    frame->data_length = nbytes;
+    send_lossless_frame(frame, tox_packet_buf);
+    
+
+    return;
+} 
+
 int do_server_loop()
 {
     struct timeval tv, tv_start, tv_end;
@@ -1017,6 +1185,7 @@ int do_server_loop()
     int sent_data = 0;
 
     tox_callback_friend_lossless_packet(tox, parse_lossless_packet);
+    tox_callback_friend_lossy_packet(tox, parse_lossy_packet);
 
     tv.tv_sec = 0;
     tv.tv_usec = 20000;
@@ -1082,53 +1251,20 @@ int do_server_loop()
             {
                 log_printf(L_DEBUG, "Current tunnel: %p", tun);
                 if(FD_ISSET(tun->sockfd, &fds))
-                {
-                    int nbytes = recv(tun->sockfd, 
-                            tox_packet_buf+PROTOCOL_BUFFER_OFFSET, 
-                            READ_BUFFER_SIZE, 0);
-
-                    /* Check if connection closed */
-                    if(nbytes <= 0)
-                    {
-                        uint8_t data[PROTOCOL_BUFFER_OFFSET];
-                        protocol_frame frame_st, *frame;
-
-                        if(nbytes == 0)
+                {  
+                    if (tun->is_udp) {
+                        server_forward_udp(tun, tox_packet_buf);
+                        if(errno == EAGAIN || errno == EWOULDBLOCK)
                         {
-                            log_printf(L_WARNING, "conn closed!\n");
+                            continue;
                         }
-                        else
-                        {
-                            log_printf(L_WARNING, "conn closed, code=%d (%s)\n",
-                                    errno, strerror(errno));
-                        }
-
-                        frame = &frame_st;
-                        memset(frame, 0, sizeof(protocol_frame));
-                        frame->friendnumber = tun->friendnumber;
-                        frame->packet_type = PACKET_TYPE_TCP_FIN;
-                        frame->connid = tun->connid;
-                        frame->data_length = 0;
-                        send_frame(frame, data);
-                        sent_data = 1;
-
-                        tunnel_queue_delete(tun);
-                                            
-                        continue;
-                    }
+                    } 
                     else
                     {
-                        protocol_frame frame_st, *frame;
-
-                        frame = &frame_st;
-                        memset(frame, 0, sizeof(protocol_frame));
-                        frame->friendnumber = tun->friendnumber;
-                        frame->packet_type = PACKET_TYPE_TCP;
-                        frame->connid = tun->connid;
-                        frame->data_length = nbytes;
-                        send_frame(frame, tox_packet_buf);
-                        sent_data = 1;
+                        server_forward_tcp(tun, tox_packet_buf);
                     }
+
+                    sent_data = 1;
                 }
             }
             log_printf(L_DEBUG, "Tunnel iteration done");
@@ -1361,6 +1497,10 @@ void parse_all_proxy(struct Tox_Options *tox_options)
         log_printf(L_INFO, "%s proxy is not used for outgoing tunneled connections, just for Tox network traffic", proto_name);
     }
 
+    if (client_mode && client_lossy_mode) {
+        log_printf(L_WARNING, "ALL_PROXY env variable is set. UDP is not used for Tox network traffic", all_proxy);
+    }
+
     tox_options_set_proxy_type(tox_options, proxy_type);
     tox_options_set_proxy_host(tox_options, hostname);
     tox_options_set_proxy_port(tox_options, remote_port);
@@ -1384,6 +1524,7 @@ void help()
     fprintf(stdout, "    -i <toxid>  - remote point Tox ID\n");
     fprintf(stdout, "    -L <localport>:<remotehostname>:<remoteport>\n");
     fprintf(stdout, "                - forward <remotehostname>:<remoteport> to 127.0.0.1:<localport>\n");
+    fprintf(stdout, "    -D          - UDP+lossy mode\n");
     fprintf(stdout, "    -W <remotehostname>:<remoteport> - forward <remotehostname>:<remoteport> to\n");
     fprintf(stdout, "                                       stdin/stdout (SSH ProxyCommand mode)\n");
     fprintf(stdout, "    -p          - ping the server from -i and exit\n");
@@ -1431,10 +1572,11 @@ int main(int argc, char *argv[])
 
     log_init();
 
-    while ((oc = getopt(argc, argv, "L:pi:I:C:s:f:W:dqhSF:DzU:t:u:b:V")) != -1)
+    while ((oc = getopt(argc, argv, "L:pDi:I:C:s:f:W:dqhSF:DzU:t:u:b:V")) != -1)
     {
         switch(oc)
         {
+
             case 'L':
                 port_forward = local_port_forward_create();
 
@@ -1487,6 +1629,9 @@ int main(int argc, char *argv[])
                 {
                     min_log_level = L_INFO;
                 }
+                break;
+            case 'D':
+                client_lossy_mode = 1;
                 break;
             case 'i':
                 /* Tox ID */

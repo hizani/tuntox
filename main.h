@@ -27,18 +27,26 @@
 #include "utlist.h"
 
 
-#define PROTOCOL_MAGIC_V1 0xa26a
-#define PROTOCOL_MAGIC_V2 0xa26b
-#define PROTOCOL_MAGIC PROTOCOL_MAGIC_V2
-#define PROTOCOL_MAGIC_HIGH (PROTOCOL_MAGIC >> 8)
-#define PROTOCOL_MAGIC_LOW (PROTOCOL_MAGIC & 0xff)
+#define PROTOCOL_MAGIC_V1_LOSSLESS 0xa26a
+#define PROTOCOL_MAGIC_V2_LOSSLESS 0xa26b
+#define PROTOCOL_MAGIC_LOSSLESS PROTOCOL_MAGIC_V2_LOSSLESS
+#define PROTOCOL_MAGIC_LOSSLESS_HIGH (PROTOCOL_MAGIC_LOSSLESS >> 8)
+#define PROTOCOL_MAGIC_LOSSLESS_LOW (PROTOCOL_MAGIC_LOSSLESS & 0xff)
+
+#define PROTOCOL_MAGIC_V2_LOSSY 0xc96b
+#define PROTOCOL_MAGIC_LOSSY PROTOCOL_MAGIC_V2_LOSSY
+#define PROTOCOL_MAGIC_LOSSY_HIGH (PROTOCOL_MAGIC_LOSSY >> 8)
+#define PROTOCOL_MAGIC_LOSSY_LOW (PROTOCOL_MAGIC_LOSSY & 0xff)
+
 #define PACKET_TYPE_PONG 0x0100
 #define PACKET_TYPE_PING 0x0108
-#define PACKET_TYPE_REQUESTTUNNEL 0x0602 /* TODO - currently unused */
+#define PACKET_TYPE_REQUESTTUNNEL_TCP 0x0602
+#define PACKET_TYPE_REQUESTTUNNEL_UDP 0x0603
 #define PACKET_TYPE_DENYTUNNEL 0x0604
-#define PACKET_TYPE_ACKTUNNEL 0x0610
-#define PACKET_TYPE_TCP  0x0600
-#define PACKET_TYPE_TCP_FIN  0x0601
+#define PACKET_TYPE_ACKTUNNEL_TCP 0x0610
+#define PACKET_TYPE_ACKTUNNEL_UDP 0x0611
+#define PACKET_TYPE_DATA  0x0600
+#define PACKET_TYPE_FIN  0x0601
 
 #define INT16_AT(array,pos) ( (*((array)+(pos)))*256 + (*((array)+(pos)+1)) )
 #define INT32_AT(array,pos) ( (*((array)+(pos)))*256*256*256 + (*((array)+(pos)+1))*256*256 +(*((array)+(pos)+2))*256 + (*((array)+(pos)+3)) )
@@ -60,6 +68,11 @@ typedef struct tunnel_t {
     int connid;
     /* Friend number of remote end */
     uint32_t friendnumber;
+    /* local source address for datagram messages */
+    struct sockaddr_storage srcaddr;
+    socklen_t srcaddr_len;
+    /* determines the type of the tunnel */
+    bool is_udp;
 
     UT_hash_handle hh;
 } tunnel;
@@ -121,6 +134,8 @@ extern Tox *tox;
 extern int client_mode;
 /* Just send a ping and exit */
 extern int ping_mode;
+/* Use UDP sockets and lossy tox packets */
+extern int client_lossy_mode;
 /* TOX_CONNECTION global variable */
 extern TOX_CONNECTION connection_status;
 /* Open a local port and forward it */
@@ -144,11 +159,13 @@ extern local_port_forward *local_port_forwards;
 
 local_port_forward *find_pending_forward_by_id(uint32_t local_forward_id);
 
+void parse_lossy_packet(Tox *tox, uint32_t friendnumber, const uint8_t *data, size_t len, void *tmp);
 void parse_lossless_packet(Tox *tox, uint32_t friendnumber, const uint8_t *data, size_t len, void *tmp);
-tunnel *tunnel_create(int sockfd, int connid, uint32_t friendnumber);
+tunnel *tunnel_create(int sockfd, int connid, uint32_t friendnumber, bool is_udp);
 void tunnel_delete(tunnel *t);
 void update_select_nfds(int fd);
-int send_frame(protocol_frame *frame, uint8_t *data);
+int send_lossy_frame(protocol_frame *frame, uint8_t *data);
+int send_lossless_frame(protocol_frame *frame, uint8_t *data);
 int send_tunnel_request_packet(char *remote_host, int remote_port, uint32_t local_forward_id, int friend_number);
 
 void print_version(void);

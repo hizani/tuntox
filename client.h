@@ -15,8 +15,11 @@
 #define CLIENT_STATE_SETUP_PIPE 13
 #define CLIENT_STATE_CONNECTION_LOST 14
 
+
 int handle_pong_frame();
-int handle_acktunnel_frame(protocol_frame *rcvd_frame);
-int handle_server_tcp_frame(protocol_frame *rcvd_frame);
-int handle_server_tcp_fin_frame(protocol_frame *rcvd_frame);
+int handle_acktunnel_frame(protocol_frame *rcvd_frame, bool is_udp);
+int handle_server_fin_frame(protocol_frame *rcvd_frame);
 int do_client_loop(uint8_t *tox_id_str);
+
+typedef int (*handle_server_data_frame_fn)(protocol_frame *rcvd_frame);
+extern handle_server_data_frame_fn handle_server_data_frame;
